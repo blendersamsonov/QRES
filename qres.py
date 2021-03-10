@@ -5,16 +5,13 @@ import scipy
 import scipy.stats
 import numpy as np
 import xarray as xr
-import numpy.ma as ma
 import pandas as pd
 import threading
 import ipywidgets as widgets
 from tqdm.notebook import tqdm
 from IPython.display import display
 from expression_parser import Parser
-from functools import wraps
 from itertools import product
-from scipy.interpolate import RegularGridInterpolator
 from collections import namedtuple
 
 # For some reason np.sqrt raises warning when applied to long array
@@ -181,7 +178,6 @@ class QRES:
         print('Cannot find any field data')
         return 999
 
-        
     def attr(self,a):
         return getattr(self.a, a)
         
@@ -333,24 +329,6 @@ class QRES:
             return ss[0]
         else:
             return xr.Dataset({w:ss[i] for i, w in enumerate(weights)})
-
-    def mask_2d(self, data, mask_boundary = 1, mask_value={}, mask = 1):
-        data = ma.array(data, mask=True)
-        b = mask_boundary
-        data[b:data.shape[0]-b,b:data.shape[1]-b].mask=False
-        if 'value' in mask_value.keys():
-            data = ma.masked_values(data, **mask_value)
-            
-        mask = np.array(mask)
-        if len(mask.shape) != 2:
-            mask = mask.reshape((1,-1))
-        kron = np.kron( 1 - mask, np.ones( ( int(data.shape[0]/mask.shape[0]), int(data.shape[1]/mask.shape[1]) ) ) )
-        h = np.array([0,data.shape[0]-kron.shape[0]])
-        w = np.array([0,data.shape[1]-kron.shape[1]])
-        h = np.abs(np.ceil(h-np.mean(h))).astype('int')
-        w = np.abs(np.ceil(w-np.mean(w))).astype('int')
-        data.mask = np.logical_or(data.mask, np.pad(kron,(h,w),'edge'))
-        return data
 
     def load_fields(self, ts, fields, update = True):
         ts = pd.Index(ts, name='t')
