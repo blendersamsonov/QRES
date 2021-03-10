@@ -332,7 +332,7 @@ class QRES:
 
     def load_fields(self, ts, fields, update = True):
         ts = pd.Index(ts, name='t')
-        return xr.Dataset({f : xr.concat([self.read_field(t, f).field.onaxis() for t in ts], dim=ts) for f in fields})
+        return xr.Dataset({f : xr.concat([self.read_field(t, f).field.onaxis() for t in tqdm(ts)], dim=ts) for f in fields})
 
     def field_to_filename(self,field):
         d = {'n_E':'rho','n_P':'rho_p','n_G':'rho_ph','n_I':f"irho_{self.a.icmr:g}_"}
@@ -441,7 +441,7 @@ class QRES:
 
     def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None):
         if space is None:
-            space = self.particle_space
+            space = self.particle_space + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
         cmr = {'e':-1,'p':1,'g':0,'i':self.a.icmr}[p]
         files = [file for file in os.listdir(self.df) if re.match(f"track_{cmr}_[0-9]",file) is not None]
         if amount <= 1:
@@ -486,8 +486,9 @@ class QRES:
         
         energy = pd.read_csv(self.df+'energy',header=None,sep='\t',names=['w','e','p','g','i'])
         try:
-            deleted = pd.read_csv(self.df+'energy_deleted',header=None,sep='\t',names=['e','p','g','i'])
-            energy = energy.add(deleted, fill_value=0)
+            deleted = pd.read_csv(self.df+'energy_deleted',header=None,sep='\t',names=['e_del','p_del','g_del','i_del'])
+#             energy = energy.add(deleted, fill_value=0)
+            energy = energy.join(deleted)
         except FileNotFoundError:
             if self.debug:
                 print('Deleted energy file not found')
