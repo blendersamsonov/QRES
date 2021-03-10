@@ -513,6 +513,13 @@ class QRES:
         N.index *= self.a.dt
         N.index.name = 't'
         return N
+
+    def read_spectrum(self, t, p):
+        d = {'e':'','p':'_p','g':'_ph','i':f"_{self.a.icmr:g}_"}
+        suff = d[p]
+        s = pd.read_csv(self.df+'spectrum'+suff+f"{t:g}",header=None,sep='\t',names=['n'])
+        s.index *= self.a.__getattribute__("deps"+suff)
+        return s
     
     def text_to_bin(self):
         pass
