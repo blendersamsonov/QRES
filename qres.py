@@ -439,33 +439,43 @@ class QRES:
         elif order == 'rc':
             return self.parser.evaluate(expression,'field',t=t,space=space,stat=stat,target_shape=target_shape,range=range,smooth=smooth)
 
-    def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None):
-        if space is None:
-            space = self.particle_space + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
-        cmr = {'e':-1,'p':1,'g':0,'i':self.a.icmr}[p]
-        files = [file for file in os.listdir(self.df) if re.match(f"track_{cmr}_[0-9]",file) is not None]
-        if amount <= 1:
-            amount = amount * len(files)
-#             amount = amount * len([file for file in os.listdir(self.df) if re.match(f"track_[0-9]",file) is not None])
-        amount = int(amount)
-        print(amount)
-        trs=[]
-        i = seed
-        for f in np.roll(files, seed)[:amount]:
-            tmp=pd.DataFrame(pd.read_csv(self.df+f,header=None,sep='\t').values.reshape(-1,len(space)),columns=space).to_xarray()
-#                 tmp=pd.DataFrame(pd.read_csv(self.df+f'track_{i}',header=None,sep='\t').values.reshape(-1,len(self.particle_space)),columns=self.particle_space)
-            # tmp['n'] = i
-            tmp=tmp.rename({'index':'t'})
-            tmp.coords['t'] = tmp.coords['t'] * self.a.dt
-            tmp['x'] = tmp['x'] - vx * tmp.coords['t']
-            # if condition != '':
-            #     if tmp.shape == tmp.query(condition).shape:
-            #         trs.append(tmp)
-            # else:
-            #     trs.append(tmp)
-            trs.append(tmp)
-        return xr.concat(trs, xr.IndexVariable('n', np.arange(0,len(trs))))#, coords = 'minimal', compat='equals' )
-        # return pd.concat(trs,keys=[f"{p}{trs[i]['n'].values[0]}" for i in range(len(trs))])
+    def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None, save = True):
+        ncfile = f'{self.df}tracks_{p}.nc'
+        try:
+            tracks = xr.open_dataset(ncfile)
+            if self.debug:
+                print('Reading from file '+ncfile)
+        except FileNotFoundError:
+            if space is None:
+                space = self.particle_space + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
+            cmr = {'e':-1,'p':1,'g':0,'i':self.a.icmr}[p]
+            files = [file for file in os.listdir(self.df) if re.match(f"track_{cmr}_[0-9]",file) is not None]
+            if amount <= 1:
+                amount = amount * len(files)
+    #             amount = amount * len([file for file in os.listdir(self.df) if re.match(f"track_[0-9]",file) is not None])
+            amount = int(amount)
+            print(amount)
+            trs=[]
+            i = seed
+            for f in np.roll(files, seed)[:amount]:
+                tmp=pd.DataFrame(pd.read_csv(self.df+f,header=None,sep='\t').values.reshape(-1,len(space)),columns=space).to_xarray()
+    #                 tmp=pd.DataFrame(pd.read_csv(self.df+f'track_{i}',header=None,sep='\t').values.reshape(-1,len(self.particle_space)),columns=self.particle_space)
+                # tmp['n'] = i
+                tmp=tmp.rename({'index':'t'})
+                tmp.coords['t'] = tmp.coords['t'] * self.a.dt
+                tmp['x'] = tmp['x'] - vx * tmp.coords['t']
+                # if condition != '':
+                #     if tmp.shape == tmp.query(condition).shape:
+                #         trs.append(tmp)
+                # else:
+                #     trs.append(tmp)
+                trs.append(tmp)
+            tracks = xr.concat(trs, xr.IndexVariable('n', np.arange(0,len(trs))))
+            if save:
+                if self.debug:
+                    print('Writing to file '+ncfile)
+                tracks.to_netcdf(ncfile, format='NETCDF4', engine='h5netcdf')
+        return tracks
     
     def read_energy(self,norm_to='t',cut_instability=True):
         """
