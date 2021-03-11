@@ -27,7 +27,7 @@ def E0(lmbda, m=me, q = el):
 
 def j0(lmbda):
     """ Returns normalizing current used in PIC """
-    return 0
+    return el * c * Ncr(lmbda)
 
 def omega_pl(Ne, gamma = 1):
     """ Returns plasma frequency for given density """
