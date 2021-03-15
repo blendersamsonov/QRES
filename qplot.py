@@ -1,5 +1,6 @@
 import numpy as np
 import xarray as xr
+from utilities import *
 
 #####################
 ### BIAS AND GAIN ###
@@ -211,7 +212,7 @@ def plot_2d(ax, div, qres, t, field, plane = 'xy', mask = None, cbar = False, cb
     if field == 'n_E':
         f = -f
     if field in ["n_E", "n_P"]:
-        f *= qres.a.ne
+        f *= Ncr(qres.a.lamda)
     if mask is None:
         mask = [[1,1],[1,1]]
     mask = np.array(mask)

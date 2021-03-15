@@ -441,11 +441,16 @@ class QRES:
 
     def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None, save = True):
         ncfile = f'{self.df}tracks_{p}.nc'
+        read = False
         try:
             tracks = xr.open_dataset(ncfile)
-            if self.debug:
+            if tracks.t.max().values < self.t_max():
+                read = True
+            elif self.debug:
                 print('Reading from file '+ncfile)
         except FileNotFoundError:
+            read = True
+        if read:
             if space is None:
                 space = self.particle_space + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
             cmr = {'e':-1,'p':1,'g':0,'i':self.a.icmr}[p]
