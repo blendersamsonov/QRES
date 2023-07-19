@@ -55,7 +55,7 @@ def plot_vcolorbar(im, axes, fig=None, divider=None, name='',pad=0.3,**kwargs):
     if divider is None:
         divider = make_axes_locatable(axes)
     cax = divider.append_axes("right", size='5%', pad=pad)
-    cb = fig.colorbar(im, cax=cax, orientation='vertical', fraction=0.05,**kwargs)
+    cb = fig.colorbar(im, cax=cax, orientation='vertical', **kwargs)
     # cb.set_alpha(1)
     # cb.draw_all()
     cb.set_label(name)

@@ -6,25 +6,14 @@ import scipy.stats
 import numpy as np
 import xarray as xr
 import pandas as pd
-import threading
-import ipywidgets as widgets
 from tqdm.notebook import tqdm
-from IPython.display import display
 from expression_parser import Parser
 from itertools import product
 from collections import namedtuple
+import h5py
 
 # For some reason np.sqrt raises warning when applied to long array
 np.seterr(invalid='ignore')
-
-def get_ioloop():
-    import IPython, zmq
-    ipython = IPython.get_ipython()
-    if ipython and hasattr(ipython, 'kernel'):
-        return zmq.eventloop.ioloop.IOLoop.instance()
-
-#The IOloop is shared
-ioloop = get_ioloop()
 
 @xr.register_dataset_accessor("field")
 class FieldAccessor:
@@ -59,49 +48,6 @@ class FieldAccessor:
             ds['zz'] = f
         return f
 
-class Binarizer(threading.Thread):
-    def __init__(self, ioloop, qres):
-        super().__init__()
-        self.qres = qres
-        self.ioloop = ioloop
-        self.output = widgets.HTML(value='Binarizing data in the background')
-        self._quit = threading.Event()
-        self.start()
-        display(self.output)
-    
-    def run(self):
-        i = 0
-        res = 1
-        ready_fields = []
-        fnames = ''.join([f'{f}|' for f in self.qres.readable_fields])
-        pattern = f'({fnames})  '
-        while not self._quit.isSet():
-            all_fields = [file for file in os.listdir(self.qres.df) if re.match(pattern+'$', file) is not None]
-            ready_fields = [file[:-3] for file in os.listdir(self.qres.df) if re.match(pattern+'\.nc$', file) is not None]
-            for f in all_fields:
-                field, t = re.split(f'({fnames})',f,maxsplit=1)[-2:]
-                t = float(t)
-                # print(field, t)
-                if f not in ready_fields:
-                    try:
-                        self.qres.read_field(t, field) # Reading and saving data to .nc file to allow lazy access
-                    except:
-                        continue
-                    # ready_fields.append(f)
-                    res = f'{field} at {t}'
-                    break
-                res = 'is done'
-            def update_output(i, res):
-                self.output.value = f'Binarizing data in the background. Proccesing {res}'+''.join(['.' for j in range(i%4)])
-            time.sleep(0.05)
-            # self.qres.binarize_fields()
-            i += 1
-            self.ioloop.add_callback(update_output, i, res)
-        self.output.value = 'Quitted'
-            
-    def quit(self):
-        self._quit.set()
-
 class QRES:
     df = None
     t_current = 0
@@ -112,10 +58,12 @@ class QRES:
     debug = True
     parser = None
 
-    def __init__(self, df, binarize_fields = False, binarize_particles = True, load=['e','b','n_P','n_E','n_G','n_I']):
+    def __init__(self, df, debug = True, scale='lambda'):
+        self.debug = debug
         self.df = df
-        log = pd.read_csv(df+'log',header=None,sep='\t',na_values='$').dropna()
-        log = log.iloc[:(log[0].str.contains('#')).idxmax()-1]
+        log = pd.read_csv(df+'log',header=None,sep='\t',na_values='$',skip_blank_lines=False,na_filter=False)
+        log = log.iloc[:(log[0].str.contains('#')).idxmax()]
+        log = log[log[0] != '$']
         log = pd.DataFrame(log.values.reshape(-1,2)).transpose()
         log.columns = log.iloc[0]
         log.drop(log.index[0], inplace=True)
@@ -125,7 +73,10 @@ class QRES:
         except KeyError:
             log['icmr'] = -9999
         for c in 'xyz':
-            log[f'l{c}']=log[f'd{c}']*log[f'n{c}']
+            mul = 1
+            if scale == 'um':
+                mul = float(log['lambda']) * 1e4
+            log[f'l{c}']=log[f'd{c}']*log[f'n{c}']*mul
         self.conf = log
         d = log.rename(columns={'lambda':'lamda'}).to_dict('records')[0]
         attrs = namedtuple('Attributes', d)
@@ -134,20 +85,18 @@ class QRES:
         self.readable_fields = [''.join(i) for i in product(fields,['x','y','z'],['','_beam'])]+ ['w','inv','n_E','n_P','n_I','n_G'] + fields
         self.computables += self.readable_fields
 
-        self.particle_space = ['q','x','y','z','ux','uy','uz','g','chi','ID']
+        self.hdf5_output = "Fields_xy_0.h5" in os.listdir(self.df)
+        if self.debug:
+            print("HDF5 output")
+
+        self.particle_space = ['q','x','y','z','ux','uy','uz','g','chi']#,'ID']
         self.readable_particle_data = [''.join(i) for i in product([''.join(i) for i in product(['','u','v','theta','phi'],['x','y','z'])] + ['q','g','chi','ID','vperp','uperp','u','v'], ['_E','_I','_P','_G'])]
         self.computables += self.readable_particle_data
 
-        self.ts = pd.Index(np.arange(0, self.t_max() + self.a.output_period, self.a.output_period), name='t')
+        # self.ts = pd.Index(np.arange(0, self.t_max() + self.a.output_period, self.a.output_period), name='t')
+        self.ts = xr.IndexVariable(dims = 't', data = self.get_output_ts()).astype(float)
         
         self.parser = Parser(self.computables, self.read_grid_data)
-#         if binarize_fields:
-#             self.binarizer = self.Binarizer(get_ioloop(), self)
-
-        # if len(load) > 0:
-        #     self.fields = self.load_fields(self.ts, load)
-        # self.energy = self.read_energy()
-        # self.n = self.read_N()
 
     def rename_outputs(self):
         pars = {'_p':'_P','_ph':'_G',f"_{self.a.icmr:g}_":'_I'}
@@ -165,6 +114,19 @@ class QRES:
             if files_orig[i] != f:
                 os.rename(f'{self.df}'+files_orig[i], f'{self.df}'+f)
 
+    def get_output_ts(self):
+        ts = []
+        for file in os.listdir(self.df):
+            if self.hdf5_output:
+                pattern = "Fields_(xy|xz|yz)_(.*)\.h5"
+            else:
+                pattern = "w([0-9].*)"
+            if (m := re.match(pattern, file)) is not None:
+                t = m.groups()[-1]
+                if t not in ts:
+                    ts.append(t)
+        ts.sort(key = lambda x : float(x))
+        return ts
 
     def t_max(self):
         """
@@ -175,13 +137,14 @@ class QRES:
                 return max([float(file[len(f):]) for file in os.listdir(self.df) if re.match(f'{f}([0-9]+)(\.[0-9]*)*', file) is not None])
             except ValueError:
                 continue
-        print('Cannot find any field data')
+        if self.debug:
+            print('Cannot find any field data')
         return 999
 
     def attr(self,a):
         return getattr(self.a, a)
         
-    def read_particles(self, t = None, p = 'e', space = None, chunks = 'auto', amount = 1.0, save = True):
+    def read_particles(self, t = None, p = 'e', space = None, chunks = 'auto', amount = 1.0, save = True, deleted = False):
         """
         Reads particles data.
         
@@ -206,7 +169,7 @@ class QRES:
             If int sets total number of particles to read. If float < 1 sets percentage of total particles.
         """
 
-        h5file = f'{self.df}{p}{t:g}.h5'
+        h5file = f"{self.df}{'del_' if deleted else ''}{p}{t:g}.h5"
         try:
             with pd.HDFStore(h5file) as store:
                 data = store['df']
@@ -214,20 +177,20 @@ class QRES:
                     print('Reading from file '+h5file)
         except KeyError:
             particle_space = self.particle_space
-            s = 'phasespace'
+            s = 'phasespace' if not deleted else 'deleted'
             d = {'e':'','p':'_p','g':'_ph','i':f"_{self.a.icmr:g}_"}
             try:
                 s += d[p]
             except KeyError:
                 print('Unsupported type of particles')
                 return
-            if p == 'g':
-                s = 'deleted_ph'
-                particle_space = ['ID','q','x','y','z','ux','uy','uz','g','chi']
+            # if p == 'g':
+            #     s = 'deleted_ph'
+            #     particle_space = ['ID','q','x','y','z','ux','uy','uz','g','chi']
             df = self.df+s+f'{t:g}'
             
             nchunks = 1 # number of chunks
-            if chunks: # !! REDO MORE CONSCIOUSLY !!
+            if chunks == 'auto': # !! REDO MORE CONSCIOUSLY !!
                 nchunks = 10
                 def file_len(fname):
                     with open(fname) as f:
@@ -235,7 +198,9 @@ class QRES:
                             pass
                     return i + 1
                 
-                chunksize = int(file_len(df) / len(particle_space) / 10) * len(particle_space)
+                chunksize = int(file_len(df) / len(particle_space) / nchunks) * len(particle_space)
+            elif chunks is not None:
+                chunksize = chunks * len(particle_space)
             else:
                 chunksize = None
             
@@ -244,7 +209,9 @@ class QRES:
             else:
                 arg = {'n':int(np.ceil(amount/nchunks))}
             iter_csv = pd.read_csv(df, header=None,sep='\t', chunksize=chunksize, iterator=True)
-            data = pd.concat( [pd.DataFrame(chunk.values.reshape(-1,len(particle_space)),columns=particle_space).sample(**arg) for chunk in iter_csv] )
+            if self.debug:
+                iter_csv = tqdm(iter_csv)
+            data = pd.concat( [pd.DataFrame(chunk.values.reshape(-1,len(particle_space)),columns=particle_space).sample(**arg, replace=True) for chunk in iter_csv] )
             data.reset_index(inplace = True, drop = True)
             if data.shape[0] > amount and amount > 1:
                 data = data.iloc[:int(amount)]
@@ -332,7 +299,9 @@ class QRES:
 
     def load_fields(self, ts, fields, update = True):
         ts = pd.Index(ts, name='t')
-        return xr.Dataset({f : xr.concat([self.read_field(t, f).field.onaxis() for t in tqdm(ts)], dim=ts) for f in fields})
+        if self.debug:
+            ts = tqdm(ts)
+        return xr.Dataset({f : xr.concat([self.read_field(t, f).field.onaxis() for t in ts], dim=ts) for f in fields})
 
     def field_to_filename(self,field):
         d = {'n_E':'rho','n_P':'rho_p','n_G':'rho_ph','n_I':f"irho_{self.a.icmr:g}_"}
@@ -341,7 +310,7 @@ class QRES:
         except:
             return field
 
-    def read_field(self, t=None, field='ey', save = True):
+    def read_field(self, t=None, field='ey', save=True):
         """
         Reads fields data in 1d or 2d.
         
@@ -358,38 +327,130 @@ class QRES:
              - ne, np, ni, ng - electron, positron, ion, photon density
         """
         
-        ncfile = f'{self.df}{field}{t:g}.nc'
-        try:
-            f = xr.open_dataset(ncfile)
-            if self.debug:
-                print('Reading from file '+ncfile)
+        if field in ['e','b','j']:
+            fx, fy, fz = self.read_field(t,f"{field}x"), self.read_field(t,f"{field}y"), self.read_field(t,f"{field}z")
+            return np.sqrt( fx * fx + fy * fy + fz * fz )
+        elif field == 'q':
+            return self.read_field(t,'n_P') + self.read_field(t,'n_I') - self.read_field(t,'n_E')
+
+        if self.hdf5_output:
+            strt = self.get_t_str(t)
+            fs = {}
+
+            xs = np.linspace(0, self.a.lx, self.a.nx)
+            ys = np.linspace(0, self.a.ly, self.a.ny)
+            zs = np.linspace(0, self.a.lz, self.a.nz)
+            coords = dict(x = xs, y = ys, z = zs)
+
+            names = {}
+            for f in ['e','b','j']:
+                names.update({f"{f}{ax}" : f"{f if f == 'j' else f.upper()}/{ax}" for ax in 'xyz'})
+            names.update({'n_E':'rho','n_P':'rho_p','n_G':'rho_ph','n_I':f"irho_{self.a.icmr:g}_"})
+
+            for plane in ['xy','xz','yz']:
+                with h5py.File(f"{self.df}Fields_{plane}_{strt}.h5") as f:
+                    iteration = list(f['data'].keys())[0]
+                    try:
+                        name = names[field]
+                    except KeyError:
+                        name = field
+                    fs[plane] = xr.DataArray(f[f'data/{iteration}/meshes/{name}'][:,:], coords=[(ax, coords[ax]) for ax in plane])
+            f = xr.Dataset(fs)
             return f
-        except FileNotFoundError:
-            if field in ['e','b','j']:
-                fx, fy, fz = self.read_field(t,f"{field}x"), self.read_field(t,f"{field}y"), self.read_field(t,f"{field}z")
-                return np.sqrt( fx * fx + fy * fy + fz * fz )
-            elif field == 'q':
-                return self.read_field(t,'n_P') + self.read_field(t,'n_I') - self.read_field(t,'n_E')
-            elif field in self.readable_fields:
-                file = f"{self.df}{self.field_to_filename(field)}{t:g}"
-                nx, ny, nz = self.a.nx, self.a.ny, self.a.nz
-                if self.a.output_mode == 1 and field != 'w': # Binary mode
-                    f = np.fromfile(file)
-                else: # Text mode
-                    f = pd.read_csv(file,header=None,sep='\t').values
-                f, fyz = np.split(f, [nx*(ny+nz)])
-                xs = np.linspace(0, self.a.lx, nx)
-                ys = np.linspace(0, self.a.ly, ny)
-                zs = np.linspace(0, self.a.lz, nz)
-                fxy = xr.DataArray(f.reshape((nx,ny+nz))[:,:-nz], coords=[('x',xs),('y',ys)])
-                fxz = xr.DataArray(f.reshape((nx,ny+nz))[:,ny:], coords=[('x',xs),('z',zs)])
-                fyz = xr.DataArray(fyz.reshape((ny,nz)), coords=[('y',ys),('z',zs)])
-                f = xr.Dataset({'xy':fxy,'xz':fxz,'yz':fyz})
-                if save:
-                    if self.debug:
-                        print('Writing to file '+ncfile)
-                    f.to_netcdf(ncfile, format='NETCDF4', engine='h5netcdf')
+        else:
+            ncfile = f'{self.df}{field}{t:g}.nc'
+            try:
+                f = xr.open_dataset(ncfile)
+                if self.debug:
+                    print('Reading from file '+ncfile)
                 return f
+            except FileNotFoundError:
+                if field in self.readable_fields:
+                    file = f"{self.df}{self.field_to_filename(field)}{t:g}"
+                    nx, ny, nz = self.a.nx, self.a.ny, self.a.nz
+                    if self.a.output_mode == 1 and field != 'w': # Binary mode
+                        f = np.fromfile(file)
+                    else: # Text mode
+                        f = pd.read_csv(file,header=None,sep='\t').values
+                    f, fyz = np.split(f, [nx*(ny+nz)])
+                    xs = np.linspace(0, self.a.lx, nx)
+                    ys = np.linspace(0, self.a.ly, ny)
+                    zs = np.linspace(0, self.a.lz, nz)
+                    fxy = xr.DataArray(f.reshape((nx,ny+nz))[:,:-nz], coords=[('x',xs),('y',ys)])
+                    fxz = xr.DataArray(f.reshape((nx,ny+nz))[:,ny:], coords=[('x',xs),('z',zs)])
+                    fyz = xr.DataArray(fyz.reshape((ny,nz)), coords=[('y',ys),('z',zs)])
+                    f = xr.Dataset({'xy':fxy,'xz':fxz,'yz':fyz})
+                    if save:
+                        if self.debug:
+                            print('Writing to file '+ncfile)
+                        f.to_netcdf(ncfile, format='NETCDF4', engine='h5netcdf')
+                    return f
+    
+    def get_t_str(self, t):
+        num, dec = str(f"{t:.2f}").split(".")
+        dec = '.' + dec[:2]
+        while dec[-1] == '0':
+            dec = dec[:-1]
+        if dec == '.':
+            dec = ''
+        return num + dec
+
+    def read_3d_field(self, t=None, field='ey'):
+        if not self.hdf5_output:
+            print("3d fields are only supported for hdf output")
+            return None
+        
+        strt = self.get_t_str(t)
+        xs = np.linspace(0, self.a.lx, self.a.nx)
+        ys = np.linspace(0, self.a.ly, self.a.ny)
+        zs = np.linspace(0, self.a.lz, self.a.nz)
+        coords = dict(x = xs, y = ys, z = zs)
+
+        names = {}
+        for f in ['e','b','j']:
+            names.update({f"{f}{ax}" : f"{f if f == 'j' else f.upper()}/{ax}" for ax in 'xyz'})
+        names.update({'n_E':'rho','n_P':'rho_p','n_G':'rho_ph','n_I':f"irho_{self.a.icmr:g}_"})
+
+        with h5py.File(f"{self.df}Fields_3d_{strt}.h5") as f:
+            iteration = list(f['data'].keys())[0]
+            try:
+                name = names[field]
+            except KeyError:
+                name = field
+            f = xr.DataArray(f[f'data/{iteration}/meshes/{name}'][:,:,:], coords=[(ax, coords[ax]) for ax in "xyz"])
+        return f
+    
+    def read_3d_field_slice(self, t=None, field='ey', plane='xy', zslice=None):
+        if not self.hdf5_output:
+            print("3d fields are only supported for hdf output")
+            return None
+        
+        strt = self.get_t_str(t)
+        xs = np.linspace(0, self.a.lx, self.a.nx)
+        ys = np.linspace(0, self.a.ly, self.a.ny)
+        zs = np.linspace(0, self.a.lz, self.a.nz)
+        coords = dict(x = xs, y = ys, z = zs)
+
+        names = {}
+        for f in ['e','b','j']:
+            names.update({f"{f}{ax}" : f"{f if f == 'j' else f.upper()}/{ax}" for ax in 'xyz'})
+        names.update({'n_E':'rho','n_P':'rho_p','n_G':'rho_ph','n_I':f"irho_{self.a.icmr:g}_"})
+
+        with h5py.File(f"{self.df}Fields_3d_{strt}.h5") as f:
+            iteration = list(f['data'].keys())[0]
+            try:
+                name = names[field]
+            except KeyError:
+                name = field
+            slices = {}
+            for ax in "xyz":
+                nax = getattr(self.a, f"n{ax}")
+                if ax in plane:
+                    slices[ax] = slice(0, nax)
+                else:
+                    slices[ax] = zslice if zslice is not None else int(0.5 * nax)
+            f = xr.DataArray(f[f'data/{iteration}/meshes/{name}'][slices['x'],slices['y'],slices['z']], coords=[(ax, coords[ax]) for ax in plane])
+        return f
     
     def read_grid_data(self,t=None,field='ex',space=['x','y'],stat='mean',target_shape='auto',range='full',smooth=[5,5]):
         smooth = np.reshape(smooth,(-1))
@@ -439,12 +500,12 @@ class QRES:
         elif order == 'rc':
             return self.parser.evaluate(expression,'field',t=t,space=space,stat=stat,target_shape=target_shape,range=range,smooth=smooth)
 
-    def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None, save = True):
+    def read_tracks(self, p = 'e', amount = 1.0, vx=0, seed = 0, condition='', space = None, save = True, refresh = False):
         ncfile = f'{self.df}tracks_{p}.nc'
         read = False
         try:
             tracks = xr.open_dataset(ncfile)
-            if tracks.t.max().values < self.t_max():
+            if refresh:
                 read = True
             elif self.debug:
                 print('Reading from file '+ncfile)
@@ -452,7 +513,7 @@ class QRES:
             read = True
         if read:
             if space is None:
-                space = self.particle_space + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
+                space = self.particle_space # + ['ex', 'ey', 'ez', 'bx', 'by', 'bz']
             cmr = {'e':-1,'p':1,'g':0,'i':self.a.icmr}[p]
             files = [file for file in os.listdir(self.df) if re.match(f"track_{cmr}_[0-9]",file) is not None]
             if amount <= 1:
@@ -482,7 +543,7 @@ class QRES:
                 tracks.to_netcdf(ncfile, format='NETCDF4', engine='h5netcdf')
         return tracks
     
-    def read_energy(self,norm_to='t',cut_instability=True):
+    def read_energy(self,norm_to='tot',cut_instability=True, full=False):
         """
         Reads energy including deleted particles if availiable.
         
@@ -493,6 +554,9 @@ class QRES:
         
         cut_instability : bool, default True
             Delete data points after occurance of numeric instability
+            
+        full : bool, default False
+            Sum deleted particles energy
 
         Returns
         -------
@@ -502,20 +566,23 @@ class QRES:
         energy = pd.read_csv(self.df+'energy',header=None,sep='\t',names=['w','e','p','g','i'])
         try:
             deleted = pd.read_csv(self.df+'energy_deleted',header=None,sep='\t',names=['e_del','p_del','g_del','i_del'])
-#             energy = energy.add(deleted, fill_value=0)
-            energy = energy.join(deleted)
+            if full:
+                deleted.rename(columns={'e_del':'e','p_del':'p','g_del':'g','i_del':'i'}, inplace=True)
+                energy = energy.add(deleted, fill_value=0)
+            else:
+                energy = energy.join(deleted)
         except FileNotFoundError:
             if self.debug:
                 print('Deleted energy file not found')
-        energy['t'] = energy.sum(axis=1)
+        energy['tot'] = energy.sum(axis=1)
         energy.index *= self.a.dt
         energy.index.name = 't'
         if cut_instability:
-            energy = energy.iloc[0:np.argmax(np.gradient(energy['t'])/energy['t'].iloc[0] > 0.5)-10]
+            energy = energy.iloc[0:np.argmax(np.gradient(energy['tot'])/energy['tot'].iloc[0] > 0.5)-10]
         if norm_to in energy.columns:
             energy /= energy[norm_to][0]
         elif norm_to == 'max':
-            energy /= energy['t'].max()
+            energy /= energy['tot'].max()
         elif norm_to is not None:
             energy /= norm_to
         return energy
@@ -530,12 +597,33 @@ class QRES:
         N.index.name = 't'
         return N
 
-    def read_spectrum(self, t, p):
+    def read_spectrum(self, t, p, full = True, sum = False):
+        """
+        If sum is True, reads all the spectra up to t and sums them up
+        """
         d = {'e':'','p':'_p','g':'_ph','i':f"_{self.a.icmr:g}_"}
+        dd = {'e':'','p':'_p','g':'_ph','i':f"_i"}
         suff = d[p]
-        s = pd.read_csv(self.df+'spectrum'+suff+f"{t:g}",header=None,sep='\t',names=['n'])
-        s.index *= self.a.__getattribute__("deps"+suff)
-        return s
+        ts = [t]
+        if sum:
+            ts = list(np.arange(0, t, self.a.output_period)) + ts
+        sps = None
+        for t in ts:
+            s = pd.read_csv(self.df+'spectrum'+suff+f"{t:g}",header=None,sep='\t',names=['n'])
+            s.index *= self.a.__getattribute__("deps"+dd[p])
+            if full:
+                try:
+                    sd = pd.read_csv(self.df+'spectrum_deleted'+suff+f"{t:g}",header=None,sep='\t',names=['n'])
+                    sd.index *= self.a.__getattribute__("deps"+dd[p])
+                    s += sd
+                except:
+                    if self.debug:
+                        print('Spectrum of deleted particles is not found')
+            if sps is not None:
+                sps += s
+            else:
+                sps = s
+        return sps
     
     def text_to_bin(self):
         pass
